@@ -738,11 +738,12 @@ class _DeepLearnPageState extends State<DeepLearnPage> {
             whereArgs: [cardId],
           );
         }
-        await AppDatabase.instance.enqueueSyncOutbox(
+        await AppDatabase.instance.enqueueReviewMutation(
           txn,
-          kind: 'review_card',
-          entityId: cardId,
-          queuedAt: now,
+          cardId: cardId,
+          rating: 'Good',
+          reviewedAt: now,
+          baseRevision: (previous?['serverRevision'] as num?)?.toInt(),
         );
       });
     } catch (error) {

@@ -40,6 +40,13 @@ extension FlashCardsPageStatePart02 on _FlashCardsPageState {
               whereArgs: [card.id],
             );
           }
+          await AppDatabase.instance.enqueueReviewMutation(
+            txn,
+            cardId: card.id,
+            rating: known ? 'Good' : 'Again',
+            reviewedAt: now,
+            baseRevision: (previousState?['serverRevision'] as num?)?.toInt(),
+          );
           final resultId = await txn.insert('study_results', {
             'sessionId': sessionId,
             'cardId': card.id,
@@ -69,12 +76,6 @@ extension FlashCardsPageStatePart02 on _FlashCardsPageState {
             },
             where: 'id = ?',
             whereArgs: [sessionId],
-          );
-          await AppDatabase.instance.enqueueSyncOutbox(
-            txn,
-            kind: 'review_card',
-            entityId: card.id,
-            queuedAt: now,
           );
           await AppDatabase.instance.enqueueSyncOutbox(
             txn,
@@ -198,6 +199,9 @@ Chỉ trả về JSON đúng mẫu: {"meanings":["nghĩa 1","nghĩa 2"],"pronunc
 
         if (!isDialogOpen || termController.text.trim() != term) return;
         setDialogState(() {
+          if (suggestions.isNotEmpty) {
+            definitionController.clear();
+          }
           meaningSuggestions = suggestions;
           pronunciationSuggestion = pronunciation.isEmpty
               ? null
@@ -218,7 +222,8 @@ Chỉ trả về JSON đúng mẫu: {"meanings":["nghĩa 1","nghĩa 2"],"pronunc
       }
     }
 
-    final result = await showDialog<StudyCardItem>(
+    final deleteRequest = Object();
+    final result = await showDialog<Object?>(
       context: context,
       barrierColor: Colors.black.withOpacity(0.48),
       builder: (dialogContext) {
@@ -578,8 +583,33 @@ Chỉ trả về JSON đúng mẫu: {"meanings":["nghĩa 1","nghĩa 2"],"pronunc
                       ],
                       SizedBox(height: 18),
                       Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
                         children: [
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              isDialogOpen = false;
+                              Navigator.pop(dialogContext, deleteRequest);
+                            },
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Color(0xffff8a80),
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 10,
+                              ),
+                              side: BorderSide(color: Color(0x99ff5252)),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            icon: Icon(Icons.delete_outline_rounded, size: 18),
+                            label: Text(
+                              "Xóa",
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          Spacer(),
                           OutlinedButton(
                             onPressed: () {
                               isDialogOpen = false;
@@ -676,7 +706,11 @@ Chỉ trả về JSON đúng mẫu: {"meanings":["nghĩa 1","nghĩa 2"],"pronunc
     definitionController.dispose();
     pronunciationController.dispose();
 
-    if (result == null) return;
+    if (identical(result, deleteRequest)) {
+      await this.deleteCurrentCard();
+      return;
+    }
+    if (result is! StudyCardItem) return;
 
     try {
       final db = await AppDatabase.instance.database;

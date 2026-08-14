@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -18,6 +19,31 @@ class _OutboxTicket {
   final String kind;
   final String entityId;
   final String token;
+}
+
+class _TargetedOutboxRow {
+  _TargetedOutboxRow(Map<String, Object?> row)
+      : kind = row['kind']?.toString() ?? '',
+        entityId = row['entityId']?.toString() ?? '',
+        table = row['tableName']?.toString() ?? '',
+        operation = row['operation']?.toString() ?? 'upsert',
+        remoteId = row['remoteId']?.toString(),
+        mutationId = row['mutationId']?.toString() ?? '',
+        baseRevision = (row['baseRevision'] as num?)?.toInt() ?? 0,
+        payload = row['payload']?.toString(),
+        token = row['updatedAt']?.toString() ?? '',
+        attempts = (row['attempts'] as num?)?.toInt() ?? 0;
+
+  final String kind;
+  final String entityId;
+  final String table;
+  final String operation;
+  final String? remoteId;
+  final String mutationId;
+  final int baseRevision;
+  final String? payload;
+  final String token;
+  final int attempts;
 }
 
 /// Keeps background synchronization paused while a card-learning screen is
@@ -245,6 +271,18 @@ class SupabaseSyncService {
 
       UNION
 
+      SELECT CASE
+        WHEN pending.operation = 'review' THEN CAST(pending.entityId AS INTEGER)
+        ELSE rs.cardId
+      END AS cardId
+      FROM sync_outbox pending
+      LEFT JOIN review_states rs
+        ON rs.id = CAST(pending.entityId AS INTEGER)
+      WHERE pending.tableName = 'review_states'
+        AND pending.status IN ('pending', 'conflict')
+
+      UNION
+
       SELECT DISTINCT sr.cardId AS cardId
       FROM sync_outbox pending
       INNER JOIN study_results sr
@@ -349,28 +387,64 @@ class SupabaseSyncService {
     if (_cancelSyncRequested) throw _SyncCancelled();
   }
 
-  /// Wait for an in-flight sync, then start a fresh pass that includes local
-  /// mutations made while that earlier pass was running.
+  /// Drains row-scoped mutations created atomically by SQLite CRUD triggers.
+  /// Full livePush remains available only as an explicit recovery path.
   Future<SyncResult> syncPendingChanges() async {
     if (!SupabaseConfig.isLoggedIn) {
       return SyncResult(pushed: 0, pulled: 0, error: 'Chưa đăng nhập');
     }
-    // Mark the request before enqueueing. A realtime callback or the periodic
-    // retry timer must not mistake this newly-created marker for stale work.
-    _generalPushRequestsInFlight++;
     try {
-      final entry = await _enqueueOutbox('general', '');
-      if (isLearningSyncPaused) {
-        return SyncResult(
-          pushed: 0,
-          pulled: 0,
-          logs: const ['Thay đổi local đã được lưu và chờ hết phiên học'],
-        );
-      }
-      return await _pushGeneralOutboxEntries([entry]);
-    } finally {
-      _generalPushRequestsInFlight--;
+      await beginAuthenticatedSession();
+      return await _drainTargetedOutbox();
+    } catch (error) {
+      return SyncResult(pushed: 0, pulled: 0, error: error.toString());
     }
+  }
+
+  Future<SyncResult> pushTopicMutation(int localId) =>
+      _pushTargetedEntity('topics', localId);
+
+  Future<SyncResult> pushCourseMutation(int localId) =>
+      _pushTargetedEntity('courses', localId);
+
+  Future<SyncResult> pushCardMutation(int localId) =>
+      _pushTargetedEntity('cards', localId);
+
+  Future<SyncResult> pushCardExampleMutation(int localId) =>
+      _pushTargetedEntity('card_examples', localId);
+
+  Future<SyncResult> pushReviewStateMutation(int localCardId) async {
+    if (!SupabaseConfig.isLoggedIn) {
+      return SyncResult(pushed: 0, pulled: 0, error: 'Chưa đăng nhập');
+    }
+    await beginAuthenticatedSession();
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'review_states',
+      columns: const ['id'],
+      where: 'cardId = ?',
+      whereArgs: [localCardId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return SyncResult(
+        pushed: 0,
+        pulled: 0,
+        error: 'Không tìm thấy review_state cho card $localCardId',
+      );
+    }
+    return _drainTargetedOutbox(
+      table: 'review_states',
+      entityId: '${rows.first['id']}',
+    );
+  }
+
+  Future<SyncResult> _pushTargetedEntity(String table, int localId) async {
+    if (!SupabaseConfig.isLoggedIn) {
+      return SyncResult(pushed: 0, pulled: 0, error: 'Chưa đăng nhập');
+    }
+    await beginAuthenticatedSession();
+    return _drainTargetedOutbox(table: table, entityId: '$localId');
   }
 
   Future<SyncResult> _pushGeneralOutboxEntries(
@@ -422,41 +496,592 @@ class SupabaseSyncService {
     if (!SupabaseConfig.isLoggedIn) {
       return SyncResult(pushed: 0, pulled: 0, error: 'Chưa đăng nhập');
     }
-    final requestedCardIds = cardIds?.toSet();
-    final outboxKeys = <MapEntry<String, String>>[
-      if (requestedCardIds != null && requestedCardIds.isNotEmpty)
-        ...requestedCardIds.map(
-          (cardId) => MapEntry('review_card', '$cardId'),
-        )
-      else if (sessionId != null)
-        MapEntry('review_session', '$sessionId')
-      else
-        const MapEntry('review_all', ''),
-    ];
-    final outboxEntries = <_OutboxTicket>[];
-    for (final entry in outboxKeys) {
-      outboxEntries.add(await _enqueueOutbox(entry.key, entry.value));
-    }
     final completer = Completer<SyncResult>();
     _studySyncTail = _studySyncTail.then((_) async {
       try {
-        final result = await _syncReviewStatesAfterStudyOnce(
-          sessionId: sessionId,
-          cardIds: requestedCardIds,
-          allowWhileLearning: true,
+        // Each answer already created an immutable SRS event in the same
+        // SQLite transaction. Drain those RPC mutations now; do not upload a
+        // full review_states snapshot or scan unrelated tables.
+        final reviewResult = await _drainTargetedOutbox(
+          table: 'review_states',
         );
-        if (result.hasError) {
-          await _failOutbox(outboxEntries, result.error!);
-        } else {
-          await _completeOutbox(outboxEntries);
-        }
-        completer.complete(result);
+        final sessionResult = sessionId == null
+            ? SyncResult(pushed: 0, pulled: 0)
+            : await _pushStudySessionAndResults(sessionId);
+        final combinedErrors = [reviewResult.error, sessionResult.error]
+            .whereType<String>()
+            .where((value) => value.isNotEmpty)
+            .toList(growable: false);
+        completer.complete(SyncResult(
+          pushed: reviewResult.pushed + sessionResult.pushed,
+          pulled: 0,
+          error: combinedErrors.isEmpty ? null : combinedErrors.join(' | '),
+        ));
       } catch (error, stackTrace) {
-        await _failOutbox(outboxEntries, error);
         completer.completeError(error, stackTrace);
       }
     }).catchError((_) {});
     return completer.future;
+  }
+
+  Future<SyncResult> _pushStudySessionAndResults(int sessionId) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      final sessions = await db.query(
+        'study_sessions',
+        where: 'id = ?',
+        whereArgs: [sessionId],
+        limit: 1,
+      );
+      if (sessions.isEmpty) {
+        return SyncResult(pushed: 0, pulled: 0);
+      }
+      final ownerId = SupabaseConfig.currentUser!.id;
+      final session = sessions.first;
+      final courseId = _localInt(session['courseId']);
+      if (courseId == null) throw StateError('Study session thiếu courseId');
+      final remoteCourseId = await _ensureTargetedRemoteId(
+        db,
+        'courses',
+        courseId,
+      );
+      final sessionPayload = _studySessionLocalToRemote(session, ownerId)
+        ..['course_id'] = remoteCourseId;
+      await SupabaseConfig.client.from('study_sessions').upsert(
+        [sessionPayload],
+        onConflict: 'id',
+      );
+
+      final resultRows = await db.query(
+        'study_results',
+        where: 'sessionId = ?',
+        whereArgs: [sessionId],
+      );
+      final resultPayload = <Map<String, dynamic>>[];
+      for (final row in resultRows) {
+        final cardId = _localInt(row['cardId']);
+        if (cardId == null) continue;
+        final remoteCardId = await _ensureTargetedRemoteId(db, 'cards', cardId);
+        resultPayload.add(
+          _studyResultLocalToRemote(row, ownerId)
+            ..['card_id'] = remoteCardId,
+        );
+      }
+      if (resultPayload.isNotEmpty) {
+        await SupabaseConfig.client.from('study_results').upsert(
+          resultPayload,
+          onConflict: 'id',
+        );
+      }
+      await db.delete(
+        'sync_outbox',
+        where: 'kind = ? AND entityId = ?',
+        whereArgs: ['review_session', '$sessionId'],
+      );
+      return SyncResult(
+        pushed: 1 + resultPayload.length,
+        pulled: 0,
+      );
+    } catch (error) {
+      return SyncResult(pushed: 0, pulled: 0, error: error.toString());
+    }
+  }
+
+  Future<SyncResult> _drainTargetedOutbox({
+    String? table,
+    String? entityId,
+  }) async {
+    await AppDatabase.instance.ensureSyncOutboxTable();
+    final db = await AppDatabase.instance.database;
+    final now = DateTime.now().toUtc().toIso8601String();
+    final where = <String>[
+      'tableName IS NOT NULL',
+      "status = 'pending'",
+      '(nextAttemptAt IS NULL OR nextAttemptAt <= ?)',
+      if (table != null) 'tableName = ?',
+      if (entityId != null) "(entityId = ? OR entityId LIKE ?)",
+    ];
+    final args = <Object?>[
+      now,
+      if (table != null) table,
+      if (entityId != null) entityId,
+      if (entityId != null) '$entityId:%',
+    ];
+    final rows = await db.query(
+      'sync_outbox',
+      where: where.join(' AND '),
+      whereArgs: args,
+      orderBy: 'createdAt ASC',
+      limit: 200,
+    );
+    if (rows.isEmpty) return SyncResult(pushed: 0, pulled: 0);
+
+    var pushed = 0;
+    final errors = <String>[];
+    for (final raw in rows) {
+      final entry = _TargetedOutboxRow(raw);
+      try {
+        await _pushTargetedOutboxRow(db, entry);
+        pushed++;
+      } catch (error) {
+        errors.add('${entry.table}/${entry.entityId}: $error');
+        await _failTargetedOutbox(db, entry, error);
+      }
+    }
+    return SyncResult(
+      pushed: pushed,
+      pulled: 0,
+      error: errors.isEmpty ? null : errors.take(3).join(' | '),
+    );
+  }
+
+  Future<void> _pushTargetedOutboxRow(
+    Database db,
+    _TargetedOutboxRow entry,
+  ) async {
+    if (entry.mutationId.isEmpty) {
+      throw StateError('Mutation v2 thiếu mutation_id');
+    }
+    await _ensureLocalDeviceId(db);
+    final payload = entry.payload == null || entry.payload!.isEmpty
+        ? <String, dynamic>{}
+        : Map<String, dynamic>.from(jsonDecode(entry.payload!) as Map);
+
+    Map<String, Object?>? localRow;
+    final localIdText = entry.entityId.split(':').first;
+    final localId = int.tryParse(localIdText);
+    if (entry.operation != 'delete' && localId != null) {
+      final rows = entry.table == 'review_states' && entry.operation == 'review'
+          ? await db.query(
+              'review_states',
+              where: 'cardId = ?',
+              whereArgs: [payload['cardId'] ?? localId],
+              limit: 1,
+            )
+          : await db.query(
+              entry.table,
+              where: 'id = ?',
+              whereArgs: [localId],
+              limit: 1,
+            );
+      if (rows.isNotEmpty) localRow = rows.first;
+      if (localRow == null && entry.operation != 'review') {
+        // The row was created then removed before it reached the server. A
+        // missing insert has no server-side effect and is safe to acknowledge.
+        await _completeTargetedOutbox(db, entry);
+        return;
+      }
+    }
+
+    dynamic response;
+    if (entry.operation == 'review') {
+      final cardId = _localInt(payload['cardId']);
+      if (cardId == null) throw StateError('Review mutation thiếu cardId');
+      final remoteCardId = await _ensureTargetedRemoteId(db, 'cards', cardId);
+      response = await SupabaseConfig.client.rpc(
+        'apply_srs_review_v2',
+        params: {
+          'p_card_id': remoteCardId,
+          'p_rating': payload['rating']?.toString() ?? 'Good',
+          'p_reviewed_at': payload['reviewedAt'],
+          'p_mutation_id': entry.mutationId,
+          'p_device_id': _localDeviceId,
+          'p_base_revision': entry.baseRevision,
+        },
+      );
+    } else {
+      final mutationPayload = entry.operation == 'delete'
+          ? payload
+          : await _targetedPayload(db, entry.table, localRow!);
+      final remoteId = entry.remoteId?.isNotEmpty == true
+          ? entry.remoteId
+          : localRow?['remoteId']?.toString().isNotEmpty == true
+              ? localRow!['remoteId']!.toString()
+              : localId == null
+                  ? null
+                  : _uuidFromLocalId(localId, _namespaceForTable(entry.table));
+      response = await SupabaseConfig.client.rpc(
+        'apply_sync_v2_mutation',
+        params: {
+          'p_table': entry.table,
+          'p_entity_id': remoteId,
+          'p_operation': entry.operation,
+          'p_payload': mutationPayload,
+          'p_mutation_id': entry.mutationId,
+          'p_device_id': _localDeviceId,
+          'p_base_revision': entry.baseRevision,
+        },
+      );
+    }
+
+    final result = response is Map
+        ? Map<String, dynamic>.from(response)
+        : throw StateError('RPC sync v2 không trả JSON object');
+    final serverRowValue = result['row'];
+    if (serverRowValue is Map && localId != null) {
+      await _applyTargetedServerAck(
+        db,
+        entry,
+        localId,
+        Map<String, dynamic>.from(serverRowValue),
+        payload,
+      );
+    }
+    await _completeTargetedOutbox(db, entry);
+  }
+
+  Future<Map<String, dynamic>> _targetedPayload(
+    Database db,
+    String table,
+    Map<String, Object?> row,
+  ) async {
+    final ownerId = SupabaseConfig.currentUser!.id;
+    late final Map<String, dynamic> result;
+    switch (table) {
+      case 'topics':
+        result = _topicLocalToRemote(row, ownerId);
+        break;
+      case 'courses':
+        final topicId = _localInt(row['topicId']);
+        final remoteTopicId = topicId == null
+            ? null
+            : await _ensureTargetedRemoteId(db, 'topics', topicId);
+        result = _courseLocalToRemote(row, ownerId)
+          ..['topic_id'] = remoteTopicId;
+        break;
+      case 'cards':
+        final courseId = _localInt(row['courseId']);
+        if (courseId == null) throw StateError('Card thiếu courseId');
+        final remoteCourseId = await _ensureTargetedRemoteId(
+          db,
+          'courses',
+          courseId,
+        );
+        result = _cardLocalToRemote(row, ownerId)
+          ..['course_id'] = remoteCourseId;
+        break;
+      case 'card_examples':
+        final cardId = _localInt(row['cardId']);
+        if (cardId == null) throw StateError('Example thiếu cardId');
+        final remoteCardId = await _ensureTargetedRemoteId(db, 'cards', cardId);
+        result = _cardExampleLocalToRemote(row, ownerId)
+          ..['card_id'] = remoteCardId;
+        break;
+      case 'review_states':
+        final cardId = _localInt(row['cardId']);
+        if (cardId == null) throw StateError('Review state thiếu cardId');
+        final remoteCardId = await _ensureTargetedRemoteId(db, 'cards', cardId);
+        result = _reviewStateLocalToRemote(row, ownerId)
+          ..['card_id'] = remoteCardId;
+        break;
+      default:
+        throw StateError('Bảng targeted không được hỗ trợ: $table');
+    }
+    return result
+      ..remove('id')
+      ..remove('owner_id')
+      ..remove('revision')
+      ..remove('updated_at')
+      ..remove('last_device_id')
+      ..remove('last_mutation_id');
+  }
+
+  Future<String> _ensureTargetedRemoteId(
+    Database db,
+    String table,
+    int localId,
+  ) async {
+    final rows = await db.query(
+      table,
+      columns: const ['remoteId', 'serverRevision'],
+      where: 'id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    if (rows.isEmpty) throw StateError('$table/$localId không tồn tại local');
+    final saved = rows.first['remoteId']?.toString() ?? '';
+    final revision = _localInt(rows.first['serverRevision']) ?? 0;
+    if (saved.isNotEmpty && revision > 0) return saved;
+
+    final pending = await db.query(
+      'sync_outbox',
+      where: 'tableName = ? AND entityId = ?',
+      whereArgs: [table, '$localId'],
+      orderBy: 'createdAt DESC',
+      limit: 1,
+    );
+    if (pending.isNotEmpty) {
+      if (pending.first['status'] != 'pending') {
+        throw StateError(
+          'Dependency $table/$localId đang ở trạng thái '
+          '${pending.first['status']}: ${pending.first['lastError']}',
+        );
+      }
+      await _pushTargetedOutboxRow(db, _TargetedOutboxRow(pending.first));
+      final refreshed = await db.query(
+        table,
+        columns: const ['remoteId'],
+        where: 'id = ?',
+        whereArgs: [localId],
+        limit: 1,
+      );
+      final remoteId = refreshed.first['remoteId']?.toString() ?? '';
+      if (remoteId.isNotEmpty) return remoteId;
+    }
+
+    final remoteId = saved.isNotEmpty
+        ? saved
+        : _uuidFromLocalId(localId, _namespaceForTable(table));
+    final now = DateTime.now().toUtc().toIso8601String();
+    await db.insert(
+      'sync_outbox',
+      {
+        'kind': 'v2:$table',
+        'entityId': '$localId',
+        'tableName': table,
+        'operation': 'upsert',
+        'remoteId': remoteId,
+        'mutationId': _newMutationId(),
+        'baseRevision': revision,
+        'createdAt': now,
+        'updatedAt': now,
+        'nextAttemptAt': now,
+        'attempts': 0,
+        'status': 'pending',
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    final dependency = await db.query(
+      'sync_outbox',
+      where: 'kind = ? AND entityId = ?',
+      whereArgs: ['v2:$table', '$localId'],
+      limit: 1,
+    );
+    await _pushTargetedOutboxRow(db, _TargetedOutboxRow(dependency.first));
+    final refreshed = await db.query(
+      table,
+      columns: const ['remoteId'],
+      where: 'id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    return refreshed.first['remoteId']?.toString() ?? remoteId;
+  }
+
+  String _newMutationId() {
+    final random = math.Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    String hex(int start, int length) => bytes
+        .skip(start)
+        .take(length)
+        .map((value) => value.toRadixString(16).padLeft(2, '0'))
+        .join();
+    return '${hex(0, 4)}-${hex(4, 2)}-${hex(6, 2)}-'
+        '${hex(8, 2)}-${hex(10, 6)}';
+  }
+
+  String _namespaceForTable(String table) => switch (table) {
+        'topics' => 'topic',
+        'courses' => 'course',
+        'cards' => 'card',
+        'card_examples' => 'card_example',
+        'review_states' => 'review_state',
+        _ => table,
+      };
+
+  Future<void> _applyTargetedServerAck(
+    Database db,
+    _TargetedOutboxRow entry,
+    int localId,
+    Map<String, dynamic> remote,
+    Map<String, dynamic> requestPayload,
+  ) async {
+    await db.transaction((txn) async {
+      final current = await txn.query(
+        'sync_outbox',
+        columns: const ['mutationId'],
+        where: 'kind = ? AND entityId = ?',
+        whereArgs: [entry.kind, entry.entityId],
+        limit: 1,
+      );
+      if (current.isEmpty || current.first['mutationId'] != entry.mutationId) {
+        return;
+      }
+      await AppDatabase.instance.suppressSyncOutbox(txn);
+      try {
+        final metadata = <String, Object?>{
+          'remoteId': remote['id']?.toString(),
+          'serverRevision': _localInt(remote['revision']) ?? 0,
+          'lastDeviceId': remote['last_device_id']?.toString(),
+          'lastMutationId': remote['last_mutation_id']?.toString(),
+          'updatedAt': _remoteTimestampToLocalIso(remote['updated_at']),
+        };
+        if (entry.operation == 'review') {
+          final cardId = _localInt(requestPayload['cardId']) ?? localId;
+          final reviewData = _reviewStateRemoteToLocal(remote)
+            ..remove('id')
+            ..['cardId'] = cardId
+            ..['remoteId'] = metadata['remoteId']
+            ..['serverRevision'] = metadata['serverRevision']
+            ..['lastDeviceId'] = metadata['lastDeviceId']
+            ..['lastMutationId'] = metadata['lastMutationId'];
+          await txn.update(
+            'review_states',
+            reviewData,
+            where: 'cardId = ?',
+            whereArgs: [cardId],
+          );
+        } else if (entry.operation != 'delete') {
+          await txn.update(
+            entry.table,
+            metadata,
+            where: 'id = ?',
+            whereArgs: [localId],
+          );
+        }
+      } finally {
+        await AppDatabase.instance.resumeSyncOutbox(txn);
+      }
+    });
+    final remoteId = remote['id']?.toString();
+    if (remoteId != null && remoteId.isNotEmpty) {
+      if (entry.table == 'topics') {
+        _topicRemoteIdByLocal['$localId'] = remoteId;
+        _topicLocalIdByRemote[remoteId] = localId;
+      } else if (entry.table == 'courses') {
+        _courseRemoteIdByLocal['$localId'] = remoteId;
+        _courseLocalIdByRemote[remoteId] = localId;
+      } else if (entry.table == 'cards') {
+        _cardRemoteIdByLocal['$localId'] = remoteId;
+        _cardLocalIdByRemote[remoteId] = localId;
+      }
+    }
+  }
+
+  Future<void> _completeTargetedOutbox(
+    Database db,
+    _TargetedOutboxRow entry,
+  ) async {
+    await db.delete(
+      'sync_outbox',
+      where: 'kind = ? AND entityId = ? AND mutationId = ?',
+      whereArgs: [entry.kind, entry.entityId, entry.mutationId],
+    );
+  }
+
+  Future<void> _failTargetedOutbox(
+    Database db,
+    _TargetedOutboxRow entry,
+    Object error,
+  ) async {
+    final text = error.toString();
+    if (text.toLowerCase().contains('sync conflict')) {
+      if (entry.operation == 'review' &&
+          await _rebaseReviewMutation(db, entry, text)) {
+        return;
+      }
+      Map<String, dynamic>? remote;
+      final remoteId = entry.remoteId;
+      if (remoteId != null && remoteId.isNotEmpty) {
+        try {
+          remote = await SupabaseConfig.client
+              .from(entry.table)
+              .select()
+              .eq('id', remoteId)
+              .maybeSingle();
+        } catch (_) {}
+      }
+      await db.update(
+        'sync_outbox',
+        {
+          'status': 'conflict',
+          'lastError': text,
+          if (remote != null)
+            'payload': jsonEncode({'conflict_remote': remote}),
+        },
+        where: 'kind = ? AND entityId = ? AND mutationId = ?',
+        whereArgs: [entry.kind, entry.entityId, entry.mutationId],
+      );
+      await ServerLogService.write('sync_v2.conflict', details: {
+        'table': entry.table,
+        'entityId': entry.entityId,
+        'baseRevision': entry.baseRevision,
+      });
+      return;
+    }
+
+    final attempts = entry.attempts + 1;
+    final dead = attempts >= 8;
+    final delaySeconds = math.min(300, math.pow(2, attempts).toInt());
+    await db.update(
+      'sync_outbox',
+      {
+        'attempts': attempts,
+        'status': dead ? 'dead' : 'pending',
+        'lastError': text,
+        'updatedAt': DateTime.now().toIso8601String(),
+        'nextAttemptAt': DateTime.now()
+            .add(Duration(seconds: delaySeconds))
+            .toUtc()
+            .toIso8601String(),
+      },
+      where: 'kind = ? AND entityId = ? AND mutationId = ?',
+      whereArgs: [entry.kind, entry.entityId, entry.mutationId],
+    );
+    if (dead) {
+      await ServerLogService.write('sync_v2.dead_letter', details: {
+        'table': entry.table,
+        'entityId': entry.entityId,
+        'attempts': attempts,
+        'error': text,
+      });
+    }
+  }
+
+  Future<bool> _rebaseReviewMutation(
+    Database db,
+    _TargetedOutboxRow entry,
+    String error,
+  ) async {
+    try {
+      final payload = Map<String, dynamic>.from(
+        jsonDecode(entry.payload ?? '{}') as Map,
+      );
+      final cardId = _localInt(payload['cardId']);
+      if (cardId == null) return false;
+      final remoteCardId = await _ensureTargetedRemoteId(db, 'cards', cardId);
+      final remote = await SupabaseConfig.client
+          .from('review_states')
+          .select('revision')
+          .eq('card_id', remoteCardId)
+          .maybeSingle();
+      final revision = _localInt(remote?['revision']) ?? 0;
+      await db.update(
+        'sync_outbox',
+        {
+          'baseRevision': revision,
+          'status': 'pending',
+          'nextAttemptAt': DateTime.now().toUtc().toIso8601String(),
+          'lastError': 'Đã rebase SRS từ revision $revision: $error',
+        },
+        where: 'kind = ? AND entityId = ? AND mutationId = ?',
+        whereArgs: [entry.kind, entry.entityId, entry.mutationId],
+      );
+      await ServerLogService.write('sync_v2.review_rebased', details: {
+        'cardId': cardId,
+        'baseRevision': revision,
+        'mutationId': entry.mutationId,
+      });
+      return true;
+    } catch (rebaseError) {
+      await ServerLogService.write('sync_v2.review_rebase_failed', details: {
+        'entityId': entry.entityId,
+        'error': rebaseError,
+      });
+      return false;
+    }
   }
 
   /// Retries durable local mutations without changing merge/LWW behavior.
@@ -465,7 +1090,6 @@ class SupabaseSyncService {
         _generalPushRequestsInFlight > 0 ||
         _activeSync != null ||
         _isPushingStudyData ||
-        isLearningSyncPaused ||
         !SupabaseConfig.isLoggedIn) {
       return null;
     }
@@ -478,7 +1102,13 @@ class SupabaseSyncService {
       final db = await AppDatabase.instance.database;
       final rows = await db.query('sync_outbox', orderBy: 'createdAt ASC');
       if (rows.isEmpty) return null;
-      if (isLearningSyncPaused) return null;
+      final targetedRows = rows
+          .where((row) => row['tableName']?.toString().isNotEmpty == true)
+          .toList(growable: false);
+      if (targetedRows.isNotEmpty) {
+        lastResult = await _drainTargetedOutbox();
+      }
+      if (isLearningSyncPaused) return lastResult;
 
       List<_OutboxTicket> ticketsFor(String kind) => rows
           .where((row) => row['kind'] == kind)
@@ -506,7 +1136,9 @@ class SupabaseSyncService {
       if (cardIds.isNotEmpty) {
         final tickets = ticketsFor('review_card');
         try {
-          lastResult = await _syncReviewStatesAfterStudyOnce(cardIds: cardIds);
+          // Compatibility cleanup for pre-v2 markers. New answers already have
+          // immutable review mutations and never create review_card tickets.
+          lastResult = await _drainTargetedOutbox(table: 'review_states');
           if (lastResult.hasError) {
             await _failOutbox(tickets, lastResult.error!);
           } else {
@@ -527,9 +1159,7 @@ class SupabaseSyncService {
             .where((ticket) => ticket.entityId == '$sessionId')
             .toList();
         try {
-          lastResult = await _syncReviewStatesAfterStudyOnce(
-            sessionId: sessionId,
-          );
+          lastResult = await _pushStudySessionAndResults(sessionId);
           if (lastResult.hasError) {
             await _failOutbox(tickets, lastResult.error!);
           } else {
@@ -544,7 +1174,7 @@ class SupabaseSyncService {
       if (rows.any((row) => row['kind'] == 'review_all')) {
         final tickets = ticketsFor('review_all');
         try {
-          lastResult = await _syncReviewStatesAfterStudyOnce();
+          lastResult = await _drainTargetedOutbox(table: 'review_states');
           if (lastResult.hasError) {
             await _failOutbox(tickets, lastResult.error!);
           } else {
@@ -1081,6 +1711,13 @@ $targetWhere
     if (!newLogin &&
         _sessionOwnerId == user.id &&
         _livePushCursorAt?.isNotEmpty == true) {
+      if (_identityOwnerId != user.id) {
+        final db = await AppDatabase.instance.database;
+        await AppDatabase.instance.ensureSyncOutboxTable();
+        await _ensureLocalDeviceId(db);
+        await _prepareIdentityMaps(db, SupabaseConfig.client, user.id);
+        _identityOwnerId = user.id;
+      }
       startRealtimeSync();
       return;
     }
@@ -1090,6 +1727,7 @@ $targetWhere
 
     final db = await AppDatabase.instance.database;
     await AppDatabase.instance.ensureSyncOutboxTable();
+    await _ensureLocalDeviceId(db);
     final boundOwnerRows = await db.query(
       'app_settings',
       columns: ['value'],
@@ -1122,6 +1760,8 @@ $targetWhere
     _livePushCursorAt = startedAt;
     await _setLocalSetting(db, key, startedAt);
     await _setLocalSetting(db, 'sync.localBoundOwnerId', user.id);
+    await _prepareIdentityMaps(db, SupabaseConfig.client, user.id);
+    _identityOwnerId = user.id;
     startRealtimeSync();
   }
 
@@ -1182,10 +1822,133 @@ $targetWhere
         print('REALTIME SUBSCRIPTION ERROR: $error');
       } else if (status == RealtimeSubscribeStatus.subscribed) {
         // A successful subscription also means the network is reachable
-        // again. Retry durable local mutations that previously failed.
-        unawaited(retryPendingOutbox());
+        // again. Replay the server delta missed while disconnected before
+        // retrying local mutations.
+        unawaited(_catchUpAfterRealtimeReconnect());
       }
     });
+  }
+
+  Future<void> _catchUpAfterRealtimeReconnect() async {
+    if (!SupabaseConfig.isLoggedIn || _isSyncing) return;
+    final db = await AppDatabase.instance.database;
+    final user = SupabaseConfig.currentUser!;
+    final key = 'sync.deltaCursor.v2.${user.id}';
+    final saved = await db.query(
+      'app_settings',
+      columns: const ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    final cursor = saved.isEmpty
+        ? DateTime.now().subtract(const Duration(minutes: 5)).toUtc()
+        : (DateTime.tryParse(saved.first['value']?.toString() ?? '') ??
+                DateTime.now().subtract(const Duration(minutes: 5)))
+            .subtract(const Duration(seconds: 5))
+            .toUtc();
+    final upperCursor = DateTime.now().toUtc();
+    _isSyncing = true;
+    final previousOperation = _operation;
+    _operation = _SyncOperation.pullReplace;
+    try {
+      final response = await SupabaseConfig.client.rpc(
+        'sync_v2_changes_since',
+        params: {'p_since': cursor.toIso8601String()},
+      );
+      final items = response is List ? response : const [];
+      final grouped = <String, List<Map<String, dynamic>>>{};
+      for (final item in items) {
+        if (item is! Map) continue;
+        final map = Map<String, dynamic>.from(item);
+        final table = map['table_name']?.toString() ?? '';
+        final row = map['row_data'];
+        if (row is Map) {
+          grouped
+              .putIfAbsent(table, () => <Map<String, dynamic>>[])
+              .add(Map<String, dynamic>.from(row));
+        }
+      }
+      for (final table in const [
+        'topics',
+        'courses',
+        'cards',
+        'card_examples',
+        'review_states',
+      ]) {
+        final rows = grouped[table];
+        if (rows == null || rows.isEmpty) continue;
+        await _applyDeltaRows(db, user.id, table, rows);
+      }
+      await _setLocalSetting(db, key, upperCursor.toIso8601String());
+    } catch (error) {
+      await ServerLogService.write('sync_v2.delta_error', details: {
+        'cursor': cursor.toIso8601String(),
+        'error': error,
+      });
+    } finally {
+      _operation = previousOperation;
+      _isSyncing = false;
+    }
+    await retryPendingOutbox();
+  }
+
+  Future<void> _applyDeltaRows(
+    Database db,
+    String ownerId,
+    String table,
+    List<Map<String, dynamic>> rows,
+  ) async {
+    final client = SupabaseConfig.client;
+    switch (table) {
+      case 'topics':
+        await _syncTable(
+          db: db, client: client, ownerId: ownerId,
+          localTable: table, remoteTable: table, idColumn: 'id',
+          localToRemote: _topicLocalToRemote,
+          remoteToLocal: _topicRemoteToLocal,
+          remoteRowsOverride: rows,
+        );
+        break;
+      case 'courses':
+        await _syncTable(
+          db: db, client: client, ownerId: ownerId,
+          localTable: table, remoteTable: table, idColumn: 'id',
+          localToRemote: _courseLocalToRemote,
+          remoteToLocal: _courseRemoteToLocal,
+          remoteRowsOverride: rows,
+        );
+        break;
+      case 'cards':
+        await _syncTable(
+          db: db, client: client, ownerId: ownerId,
+          localTable: table, remoteTable: table, idColumn: 'id',
+          localToRemote: _cardLocalToRemote,
+          remoteToLocal: _cardRemoteToLocal,
+          remoteRowsOverride: rows,
+        );
+        break;
+      case 'card_examples':
+        await _syncTable(
+          db: db, client: client, ownerId: ownerId,
+          localTable: table, remoteTable: table, idColumn: 'id',
+          localToRemote: _cardExampleLocalToRemote,
+          remoteToLocal: _cardExampleRemoteToLocal,
+          remoteRowsOverride: rows,
+        );
+        break;
+      case 'review_states':
+        await _syncTable(
+          db: db, client: client, ownerId: ownerId,
+          localTable: table, remoteTable: table, idColumn: 'id',
+          remoteConflictColumns: 'owner_id,card_id',
+          localConflictColumns: const ['cardId'],
+          localToRemote: _reviewStateLocalToRemote,
+          remoteToLocal: _reviewStateRemoteToLocal,
+          remoteRowsOverride: rows,
+        );
+        break;
+    }
   }
 
   void stopRealtimeSync() {
@@ -1230,12 +1993,10 @@ $targetWhere
   void _scheduleRealtimeApply({
     Duration delay = const Duration(milliseconds: 150),
   }) {
-    if (isLearningSyncPaused) return;
     if (_realtimeMergeDebounce?.isActive ?? false) return;
     _realtimeMergeDebounce = Timer(delay, () async {
       _realtimeMergeDebounce = null;
       if (!SupabaseConfig.isLoggedIn) return;
-      if (isLearningSyncPaused) return;
       if (_isSyncing || _isPushingStudyData) {
         await ServerLogService.write('realtime.deferred', details: {
           'syncing': _isSyncing,
@@ -1261,7 +2022,6 @@ $targetWhere
     if (!SupabaseConfig.isLoggedIn || _realtimePendingChanges.isEmpty) {
       return;
     }
-    if (isLearningSyncPaused) return;
     if (_isSyncing || _isPushingStudyData) {
       _scheduleRealtimeApply(delay: const Duration(milliseconds: 250));
       return;
@@ -1304,6 +2064,15 @@ $targetWhere
       });
     } catch (error) {
       print('REALTIME APPLY ERROR: $error');
+      for (final change in changes) {
+        final row = change.newRecord.isNotEmpty
+            ? change.newRecord
+            : change.oldRecord;
+        final id = row['id']?.toString() ?? row['key']?.toString() ?? '';
+        if (id.isNotEmpty) {
+          _realtimePendingChanges['${change.table}:$id'] = change;
+        }
+      }
       await ServerLogService.write('realtime.batch_error', details: {
         'events': changes.length,
         'error': error,
@@ -1491,6 +2260,10 @@ $targetWhere
         skipped++;
         continue;
       }
+      if (await _shouldSkipRealtimeRow(db, table, remote)) {
+        skipped++;
+        continue;
+      }
 
       if (change.eventType == PostgresChangeEvent.delete ||
           remote['deleted_at'] != null) {
@@ -1523,14 +2296,20 @@ $targetWhere
               );
               continue;
             }
-            await db.delete(
+            await _deleteRemoteAppliedRow(
+              db,
               table,
               where: 'cardId = ?',
               whereArgs: [localCardId],
             );
           }
         } else {
-          await db.delete(table, where: 'id = ?', whereArgs: [localId]);
+          await _deleteRemoteAppliedRow(
+            db,
+            table,
+            where: 'id = ?',
+            whereArgs: [localId],
+          );
         }
         if (table == 'topics') {
           _topicLocalIdByRemote.remove(remoteId);
@@ -1650,6 +2429,141 @@ $targetWhere
     } finally {
       _operation = previousOperation;
     }
+  }
+
+  Future<bool> _shouldSkipRealtimeRow(
+    Database db,
+    String table,
+    Map<String, dynamic> remote,
+  ) async {
+    final ownerId = remote['owner_id']?.toString();
+    if (ownerId != null &&
+        ownerId.isNotEmpty &&
+        ownerId != SupabaseConfig.currentUser?.id) {
+      return true;
+    }
+    await _ensureLocalDeviceId(db);
+    final remoteId = remote['id']?.toString() ?? '';
+    if (remoteId.isEmpty) return true;
+    final remoteRevision = _localInt(remote['revision']) ?? 0;
+    var localRows = await db.query(
+      table,
+      columns: const [
+        'id',
+        'serverRevision',
+        'lastDeviceId',
+        'lastMutationId',
+      ] + (table == 'review_states' ? const ['cardId'] : const []),
+      where: 'remoteId = ?',
+      whereArgs: [remoteId],
+      limit: 1,
+    );
+    int? reviewCardId;
+    if (localRows.isEmpty && table == 'review_states') {
+      final remoteCardId = remote['card_id']?.toString() ?? '';
+      if (remoteCardId.isNotEmpty) {
+        reviewCardId = _cardLocalIdByRemote[remoteCardId];
+        if (reviewCardId == null) {
+          final cards = await db.query(
+            'cards',
+            columns: const ['id'],
+            where: 'remoteId = ?',
+            whereArgs: [remoteCardId],
+            limit: 1,
+          );
+          if (cards.isNotEmpty) reviewCardId = _localInt(cards.first['id']);
+        }
+        if (reviewCardId != null) {
+          localRows = await db.query(
+            'review_states',
+            columns: const [
+              'id',
+              'serverRevision',
+              'lastDeviceId',
+              'lastMutationId',
+              'cardId',
+            ],
+            where: 'cardId = ?',
+            whereArgs: [reviewCardId],
+            limit: 1,
+          );
+        }
+      }
+    }
+    if (localRows.isEmpty) return false;
+    final local = localRows.first;
+    reviewCardId ??= _localInt(local['cardId']);
+    final localRevision = _localInt(local['serverRevision']) ?? 0;
+    final mutationId = remote['last_mutation_id']?.toString() ?? '';
+    final deviceId = remote['last_device_id']?.toString() ?? '';
+    if (mutationId.isNotEmpty &&
+        deviceId == _localDeviceId &&
+        local['lastMutationId']?.toString() == mutationId) {
+      await ServerLogService.write('realtime.self_echo_ignored', details: {
+        'table': table,
+        'id': remoteId,
+        'revision': remoteRevision,
+      });
+      return true;
+    }
+    if (remoteRevision > 0 && remoteRevision <= localRevision) return true;
+
+    final localEntityId = local['id'].toString();
+    final pendingEntityId = reviewCardId?.toString() ?? localEntityId;
+    final pendingWhere = table == 'review_states'
+        ? "tableName = ? AND (entityId = ? OR entityId = ? OR entityId LIKE ?) "
+            "AND status = 'pending'"
+        : "tableName = ? AND entityId = ? AND status = 'pending'";
+    final pendingArgs = table == 'review_states'
+        ? <Object?>[
+            table,
+            localEntityId,
+            pendingEntityId,
+            '$pendingEntityId:%',
+          ]
+        : <Object?>[table, localEntityId];
+    final pending = await db.query(
+      'sync_outbox',
+      columns: const ['mutationId'],
+      where: pendingWhere,
+      whereArgs: pendingArgs,
+      limit: 1,
+    );
+    if (pending.isNotEmpty) {
+      await db.update(
+        'sync_outbox',
+        {
+          'status': 'conflict',
+          'lastError': 'Remote revision $remoteRevision arrived while local mutation was pending',
+          'payload': jsonEncode({'conflict_remote': remote}),
+        },
+        where: pendingWhere,
+        whereArgs: pendingArgs,
+      );
+      await ServerLogService.write('realtime.conflict_deferred', details: {
+        'table': table,
+        'id': remoteId,
+        'revision': remoteRevision,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _deleteRemoteAppliedRow(
+    Database db,
+    String table, {
+    required String where,
+    required List<Object?> whereArgs,
+  }) async {
+    await db.transaction((txn) async {
+      await AppDatabase.instance.suppressSyncOutbox(txn);
+      try {
+        await txn.delete(table, where: where, whereArgs: whereArgs);
+      } finally {
+        await AppDatabase.instance.resumeSyncOutbox(txn);
+      }
+    });
   }
 
   Future<SyncResult> _syncAllOnce() async {
@@ -2213,7 +3127,9 @@ $targetWhere
       };
 
       await db.transaction((txn) async {
-        for (final remote in remoteRows) {
+        await AppDatabase.instance.suppressSyncOutbox(txn);
+        try {
+          for (final remote in remoteRows) {
           _throwIfSyncCancelled();
           if (_operation == _SyncOperation.merge &&
               remote['deleted_at'] != null) {
@@ -2380,17 +3296,11 @@ $targetWhere
             errors.add('pull row ${remote['id'] ?? remote['key']}: $e');
             print('SYNC PULL ERROR ($localTable): $e');
           }
+          }
+        } finally {
+          await AppDatabase.instance.resumeSyncOutbox(txn);
         }
       });
-
-      if (remoteIdsToDelete.isNotEmpty) {
-        try {
-          await client.from(remoteTable).delete().inFilter('id', remoteIdsToDelete);
-          print('SYNC CLEANED UP ${remoteIdsToDelete.length} ORPHANED REMOTE ROWS FROM $remoteTable');
-        } catch (e) {
-          print('SYNC CLEANUP ERROR ($remoteTable): $e');
-        }
-      }
     } catch (e) {
       errors.add('table: $e');
       print('SYNC TABLE ERROR ($localTable): $e');
@@ -2413,11 +3323,10 @@ $targetWhere
     String ownerId,
   ) {
     final localTopicId = _localInt(row['id']);
-    final remoteTopicId = _remoteIdFor(
-      _topicRemoteIdByLocal,
-      localTopicId,
-      'topic',
-    );
+    final savedRemoteId = row['remoteId']?.toString() ?? '';
+    final remoteTopicId = savedRemoteId.isNotEmpty
+        ? savedRemoteId
+        : _remoteIdFor(_topicRemoteIdByLocal, localTopicId, 'topic');
     if (localTopicId != null) {
       _topicLocalIdByRemote.putIfAbsent(
         remoteTopicId,
@@ -2442,6 +3351,10 @@ $targetWhere
       'createdAt': row['created_at'],
       'updatedAt': row['updated_at'],
       'deletedAt': row['deleted_at'],
+      'remoteId': row['id'],
+      'serverRevision': row['revision'] ?? 0,
+      'lastDeviceId': row['last_device_id'],
+      'lastMutationId': row['last_mutation_id'],
     };
   }
 
@@ -2450,11 +3363,10 @@ $targetWhere
     String ownerId,
   ) {
     final localCourseId = _localInt(row['id']);
-    final remoteCourseId = _remoteIdFor(
-      _courseRemoteIdByLocal,
-      localCourseId,
-      'course',
-    );
+    final savedRemoteId = row['remoteId']?.toString() ?? '';
+    final remoteCourseId = savedRemoteId.isNotEmpty
+        ? savedRemoteId
+        : _remoteIdFor(_courseRemoteIdByLocal, localCourseId, 'course');
     if (localCourseId != null) {
       _courseLocalIdByRemote.putIfAbsent(
         remoteCourseId,
@@ -2502,6 +3414,10 @@ $targetWhere
       'deletedAt': row['deleted_at'],
       'syncOrigin': 'remote',
       'hasLocalNameConflict': 0,
+      'remoteId': row['id'],
+      'serverRevision': row['revision'] ?? 0,
+      'lastDeviceId': row['last_device_id'],
+      'lastMutationId': row['last_mutation_id'],
     };
   }
 
@@ -2516,11 +3432,10 @@ $targetWhere
       'course',
     );
     final localCardId = _localInt(row['id']);
-    final remoteCardId = _remoteIdFor(
-      _cardRemoteIdByLocal,
-      localCardId,
-      'card',
-    );
+    final savedRemoteId = row['remoteId']?.toString() ?? '';
+    final remoteCardId = savedRemoteId.isNotEmpty
+        ? savedRemoteId
+        : _remoteIdFor(_cardRemoteIdByLocal, localCardId, 'card');
     if (localCardId != null) {
       _cardLocalIdByRemote.putIfAbsent(remoteCardId, () => localCardId);
     }
@@ -2567,6 +3482,10 @@ $targetWhere
       'createdAt': row['created_at'],
       'updatedAt': row['updated_at'],
       'deletedAt': row['deleted_at'],
+      'remoteId': row['id'],
+      'serverRevision': row['revision'] ?? 0,
+      'lastDeviceId': row['last_device_id'],
+      'lastMutationId': row['last_mutation_id'],
     };
   }
 
@@ -2575,7 +3494,9 @@ $targetWhere
     String ownerId,
   ) {
     return {
-      'id': _uuidFromLocalId(row['id'], 'card_example'),
+      'id': row['remoteId']?.toString().isNotEmpty == true
+          ? row['remoteId']
+          : _uuidFromLocalId(row['id'], 'card_example'),
       'owner_id': ownerId,
       'card_id': _remoteIdFor(_cardRemoteIdByLocal, row['cardId'], 'card'),
       'example_text': row['exampleText'],
@@ -2583,6 +3504,7 @@ $targetWhere
       'meaning': row['meaning'],
       'created_at': row['createdAt'],
       'updated_at': row['updatedAt'] ?? row['createdAt'],
+      'deleted_at': row['deletedAt'],
     };
   }
 
@@ -2596,6 +3518,11 @@ $targetWhere
       'meaning': row['meaning'],
       'createdAt': row['created_at'],
       'updatedAt': row['updated_at'],
+      'deletedAt': row['deleted_at'],
+      'remoteId': row['id'],
+      'serverRevision': row['revision'] ?? 0,
+      'lastDeviceId': row['last_device_id'],
+      'lastMutationId': row['last_mutation_id'],
     };
   }
 
@@ -2604,7 +3531,9 @@ $targetWhere
     String ownerId,
   ) {
     return {
-      'id': _uuidFromLocalId(row['id'], 'review_state'),
+      'id': row['remoteId']?.toString().isNotEmpty == true
+          ? row['remoteId']
+          : _uuidFromLocalId(row['id'], 'review_state'),
       'owner_id': ownerId,
       'card_id': _remoteIdFor(_cardRemoteIdByLocal, row['cardId'], 'card'),
       'level': row['level'] ?? 0,
@@ -2619,6 +3548,7 @@ $targetWhere
       'updated_at': _localTimestampToRemoteIso(
         row['updatedAt'] ?? row['createdAt'],
       ),
+      'deleted_at': _localTimestampToRemoteIso(row['deletedAt']),
     };
   }
 
@@ -2637,6 +3567,11 @@ $targetWhere
       'nextReviewAt': _remoteTimestampToLocalIso(row['next_review_at']),
       'createdAt': _remoteTimestampToLocalIso(row['created_at']),
       'updatedAt': _remoteTimestampToLocalIso(row['updated_at']),
+      'deletedAt': _remoteTimestampToLocalIso(row['deleted_at']),
+      'remoteId': row['id'],
+      'serverRevision': row['revision'] ?? 0,
+      'lastDeviceId': row['last_device_id'],
+      'lastMutationId': row['last_mutation_id'],
     };
   }
 
@@ -3033,6 +3968,7 @@ $targetWhere
         key == 'gemini.apiKey' ||
         key.startsWith('sync.sessionStartedAt.') ||
         key.startsWith('sync.livePushCursor.') ||
+        key.startsWith('sync.deltaCursor.') ||
         key.startsWith('sync.migration.') ||
         key.startsWith('sync.offlineDeleteRecovery');
   }
@@ -3412,6 +4348,46 @@ $targetWhere
       _cardLocalIdByRemote[remoteId] = localId;
       usedCardLocalIds.add(localId);
     }
+
+    // Persist identity and revision mappings so ordinary row mutations never
+    // need to rebuild or fetch the full topics/courses/cards catalog.
+    await db.transaction((txn) async {
+      await AppDatabase.instance.suppressSyncOutbox(txn);
+      try {
+        Future<void> persist(
+          String table,
+          Map<String, int> localByRemote,
+          List<Map<String, dynamic>> remoteRows,
+        ) async {
+          final remoteById = <String, Map<String, dynamic>>{
+            for (final row in remoteRows)
+              if (row['id'] != null) row['id'].toString(): row,
+          };
+          for (final entry in localByRemote.entries) {
+            final remote = remoteById[entry.key];
+            await txn.update(
+              table,
+              {
+                'remoteId': entry.key,
+                if (remote != null) ...{
+                  'serverRevision': _localInt(remote['revision']) ?? 0,
+                  'lastDeviceId': remote['last_device_id'],
+                  'lastMutationId': remote['last_mutation_id'],
+                },
+              },
+              where: 'id = ?',
+              whereArgs: [entry.value],
+            );
+          }
+        }
+
+        await persist('topics', _topicLocalIdByRemote, remoteTopics);
+        await persist('courses', _courseLocalIdByRemote, remoteCourses);
+        await persist('cards', _cardLocalIdByRemote, remoteCards);
+      } finally {
+        await AppDatabase.instance.resumeSyncOutbox(txn);
+      }
+    });
   }
 
   int _availableLocalId(String remoteId, Set<int> usedIds) {
@@ -3545,81 +4521,29 @@ $targetWhere
   Future<String> getRemoteCardId(int localCardId) async {
     final db = await AppDatabase.instance.database;
     await _ensureLocalDeviceId(db);
-    return _uuidFromLocalId(localCardId, 'card');
+    final rows = await db.query(
+      'cards',
+      columns: const ['remoteId'],
+      where: 'id = ?',
+      whereArgs: [localCardId],
+      limit: 1,
+    );
+    final saved = rows.isEmpty ? '' : rows.first['remoteId']?.toString() ?? '';
+    return saved.isNotEmpty
+        ? saved
+        : _uuidFromLocalId(localCardId, 'card');
   }
 
   Future<void> deleteRemoteReviewStatesForCards(
     Iterable<int> localCardIds,
   ) async {
-    final ids = localCardIds.toSet();
-    if (ids.isEmpty) return;
-    final tickets = <_OutboxTicket>[];
-    for (final id in ids) {
-      tickets.add(await _enqueueOutbox('delete_review_card', '$id'));
-    }
     if (!SupabaseConfig.isLoggedIn) return;
-    try {
-      final active = _activeSync;
-      if (active != null) await active;
-      await beginAuthenticatedSession();
-      final remoteIds = <String>[];
-      for (final localId in ids) {
-        final remoteId = await findRemoteCardId(localId);
-        if (remoteId != null && remoteId.isNotEmpty) remoteIds.add(remoteId);
-      }
-      if (remoteIds.isNotEmpty) {
-        await SupabaseConfig.client
-            .from('review_states')
-            .delete()
-            .eq('owner_id', SupabaseConfig.currentUser!.id)
-            .inFilter('card_id', remoteIds);
-      }
-      await _completeOutbox(tickets);
-    } catch (error) {
-      await _failOutbox(tickets, error);
-      rethrow;
-    }
+    await _drainTargetedOutbox(table: 'review_states');
   }
 
   Future<void> deleteRemoteCourseChildren(int localCourseId) async {
-    if (!SupabaseConfig.isLoggedIn) return;
-    final db = await AppDatabase.instance.database;
-    final cardRows = await db.query(
-      'cards',
-      columns: ['id'],
-      where: 'courseId = ?',
-      whereArgs: [localCourseId],
-    );
-    final remoteCardIds = <String>[];
-    for (final row in cardRows) {
-      final localCardId = row['id'] as int?;
-      if (localCardId == null) continue;
-      final remoteId = await findRemoteCardId(localCardId);
-      if (remoteId != null && remoteId.isNotEmpty) remoteCardIds.add(remoteId);
-    }
-    final remoteCourseId = await findRemoteCourseId(localCourseId);
-    final ownerId = SupabaseConfig.currentUser!.id;
-    if (remoteCardIds.isNotEmpty) {
-      for (final table in const [
-        'study_results',
-        'review_sentence_questions',
-        'review_states',
-        'card_examples',
-      ]) {
-        await SupabaseConfig.client
-            .from(table)
-            .delete()
-            .eq('owner_id', ownerId)
-            .inFilter('card_id', remoteCardIds);
-      }
-    }
-    if (remoteCourseId != null && remoteCourseId.isNotEmpty) {
-      await SupabaseConfig.client
-          .from('study_sessions')
-          .delete()
-          .eq('owner_id', ownerId)
-          .eq('course_id', remoteCourseId);
-    }
+    // The course tombstone RPC marks cards, examples and review states in one
+    // server transaction. Never physically delete children ahead of its ack.
   }
 
   Future<void> markRemoteCoursesDeleted(
@@ -3627,107 +4551,17 @@ $targetWhere
     required String deletedAt,
   }) async {
     if (!SupabaseConfig.isLoggedIn) return;
-
-    final db = await AppDatabase.instance.database;
-    final ownerId = SupabaseConfig.currentUser!.id;
-    final remoteCourseIds = <String>[];
-    final remoteCardIds = <String>[];
-    final requestedCourseIds = localCourseIds.toSet().toList();
-    if (requestedCourseIds.isEmpty) return;
-
-    final placeholders = List.filled(requestedCourseIds.length, '?').join(',');
-    final conflictCourseIds = (await db.query(
-      'courses',
-      columns: ['id'],
-      where:
-          'id IN ($placeholders) AND COALESCE(hasLocalNameConflict, 0) = 1',
-      whereArgs: requestedCourseIds,
-    ))
-        .map((row) => row['id'] as int?)
-        .whereType<int>()
-        .toSet();
-
-    for (final localCourseId in requestedCourseIds) {
-      // A conflict copy was never uploaded, so a same-title server course may
-      // belong to another topic and must not be touched.
-      if (conflictCourseIds.contains(localCourseId)) continue;
-      final remoteCourseId = await findRemoteCourseId(localCourseId);
-      if (remoteCourseId != null && remoteCourseId.isNotEmpty) {
-        remoteCourseIds.add(remoteCourseId);
-      }
-    }
-
-    const chunkSize = 100;
-    final uniqueCourseIds = remoteCourseIds.toSet().toList();
-    for (var i = 0; i < uniqueCourseIds.length; i += chunkSize) {
-      final chunk = uniqueCourseIds.sublist(
-        i,
-        math.min(i + chunkSize, uniqueCourseIds.length),
-      );
-      final rows = await SupabaseConfig.client
-          .from('cards')
-          .select('id')
-          .eq('owner_id', ownerId)
-          .inFilter('course_id', chunk);
-      remoteCardIds.addAll(
-        List<Map<String, dynamic>>.from(rows)
-            .map((row) => row['id']?.toString())
-            .whereType<String>(),
+    for (final localCourseId in localCourseIds.toSet()) {
+      await _drainTargetedOutbox(
+        table: 'courses',
+        entityId: '$localCourseId',
       );
     }
-
-    Future<void> markDeleted(
-      String table,
-      List<String> remoteIds,
-    ) async {
-      for (var i = 0; i < remoteIds.length; i += chunkSize) {
-        final chunk = remoteIds.sublist(
-          i,
-          math.min(i + chunkSize, remoteIds.length),
-        );
-        await SupabaseConfig.client
-            .from(table)
-            .update({'deleted_at': deletedAt, 'updated_at': deletedAt})
-            .eq('owner_id', ownerId)
-            .inFilter('id', chunk);
-      }
-    }
-
-    // Mark children first so every server row in the deleted topic receives a
-    // tombstone before its parent course is hidden.
-    await markDeleted('cards', remoteCardIds.toSet().toList());
-    await markDeleted('courses', remoteCourseIds.toSet().toList());
   }
 
   Future<void> deleteRemoteCardChildren(int localCardId) async {
-    if (!SupabaseConfig.isLoggedIn) return;
-    final db = await AppDatabase.instance.database;
-    final conflict = await db.rawQuery(
-      '''
-      SELECT COALESCE(c.hasLocalNameConflict, 0) AS isConflict
-      FROM cards ca
-      INNER JOIN courses c ON c.id = ca.courseId
-      WHERE ca.id = ?
-      LIMIT 1
-      ''',
-      [localCardId],
-    );
-    if (conflict.isNotEmpty && conflict.first['isConflict'] == 1) return;
-    final remoteCardId = await findRemoteCardId(localCardId);
-    if (remoteCardId == null || remoteCardId.isEmpty) return;
-    final ownerId = SupabaseConfig.currentUser!.id;
-    for (final table in const [
-      'study_results',
-      'review_sentence_questions',
-      'review_states',
-      'card_examples',
-    ]) {
-      await SupabaseConfig.client
-          .from(table)
-          .delete()
-          .eq('owner_id', ownerId)
-          .eq('card_id', remoteCardId);
-    }
+    // The card tombstone RPC owns child tombstones. This compatibility method
+    // intentionally performs no physical DELETE.
   }
 
   Future<String?> findRemoteCardId(int localCardId) async {

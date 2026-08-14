@@ -397,11 +397,6 @@ extension StatisticsPageStatePart06Split03 on _StatisticsPageState {
         whereArgs: [cardId],
       );
     }
-    await AppDatabase.instance.enqueueSyncOutbox(
-      executor,
-      kind: 'review_card',
-      entityId: cardId,
-    );
   }
 
 

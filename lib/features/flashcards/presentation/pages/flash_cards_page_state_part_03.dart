@@ -27,13 +27,6 @@ extension FlashCardsPageStatePart03 on _FlashCardsPageState {
         ''',
           whereArgs: [selectedCourseId],
         );
-        for (final cardId in cardIds) {
-          await AppDatabase.instance.enqueueSyncOutbox(
-            txn,
-            kind: 'delete_review_card',
-            entityId: cardId,
-          );
-        }
       });
       if (SupabaseConfig.isLoggedIn) {
         unawaited(
@@ -88,11 +81,6 @@ extension FlashCardsPageStatePart03 on _FlashCardsPageState {
             where: 'cardId = ?',
             whereArgs: [undoItem.cardId],
           );
-          await AppDatabase.instance.enqueueSyncOutbox(
-            txn,
-            kind: 'delete_review_card',
-            entityId: undoItem.cardId,
-          );
         });
         if (SupabaseConfig.isLoggedIn) {
           unawaited(
@@ -115,12 +103,6 @@ extension FlashCardsPageStatePart03 on _FlashCardsPageState {
             restored,
             where: 'cardId = ?',
             whereArgs: [undoItem.cardId],
-          );
-          await AppDatabase.instance.enqueueSyncOutbox(
-            txn,
-            kind: 'review_card',
-            entityId: undoItem.cardId,
-            queuedAt: now,
           );
         });
         if (SupabaseConfig.isLoggedIn) {

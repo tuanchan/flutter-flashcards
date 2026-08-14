@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
@@ -60,15 +62,6 @@ class AppDatabase {
           where: 'id = ?',
           whereArgs: [row['id']],
         );
-        final cardId = (row['cardId'] as num?)?.toInt();
-        if (cardId != null) {
-          await enqueueSyncOutbox(
-            txn,
-            kind: 'review_card',
-            entityId: cardId,
-            queuedAt: now,
-          );
-        }
       }
     });
     return rows.length;
@@ -103,7 +96,7 @@ class AppDatabase {
 
     return await openDatabase(
       path,
-      version: 7,
+      version: 8,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -311,7 +304,7 @@ class AppDatabase {
       )
     ''');
 
-    await _createSyncOutboxTable(db);
+    await _createSyncV2Schema(db);
     await _createVocabularyReminderTables(db);
 
     await _createIndexes(db);
@@ -337,6 +330,9 @@ class AppDatabase {
     }
     if (oldVersion < 7) {
       await _createVocabularyReminderTables(db);
+    }
+    if (oldVersion < 8) {
+      await _createSyncV2Schema(db);
     }
   }
 
@@ -443,7 +439,7 @@ class AppDatabase {
     if (_syncOutboxReady) return;
     final db = await database;
     if (_syncOutboxReady) return;
-    await _createSyncOutboxTable(db);
+    await _createSyncV2Schema(db);
   }
 
   /// Adds a durable sync marker using the same SQLite transaction that writes
@@ -482,6 +478,87 @@ class AppDatabase {
     );
   }
 
+  /// Stores one review event, not only the resulting state. The mutation ID is
+  /// the durable idempotency key used by the Supabase SRS RPC on every retry.
+  Future<String> enqueueReviewMutation(
+    DatabaseExecutor executor, {
+    required int cardId,
+    required String rating,
+    required DateTime reviewedAt,
+    int? baseRevision,
+  }) async {
+    final mutationId = _newLocalUuid();
+    final now = DateTime.now().toIso8601String();
+    final stateRows = await executor.query(
+      'review_states',
+      columns: const ['id'],
+      where: 'cardId = ?',
+      whereArgs: [cardId],
+      limit: 1,
+    );
+    if (stateRows.isNotEmpty) {
+      // The INSERT/UPDATE trigger queued a generic state upsert earlier in
+      // this transaction. Replace it with the immutable answer event so only
+      // the canonical server-side SRS algorithm advances the schedule.
+      await executor.delete(
+        'sync_outbox',
+        where: "tableName = 'review_states' AND entityId = ? "
+            "AND operation = 'upsert'",
+        whereArgs: ['${stateRows.first['id']}'],
+      );
+    }
+    await executor.insert('sync_outbox', {
+      'kind': 'v2:review_states:review',
+      'entityId': '$cardId:$mutationId',
+      'tableName': 'review_states',
+      'operation': 'review',
+      'mutationId': mutationId,
+      'baseRevision': baseRevision ?? 0,
+      'payload': jsonEncode({
+        'cardId': cardId,
+        'rating': rating,
+        'reviewedAt': reviewedAt.toUtc().toIso8601String(),
+      }),
+      'createdAt': now,
+      'updatedAt': now,
+      'nextAttemptAt': now,
+      'attempts': 0,
+      'status': 'pending',
+      'lastError': null,
+    });
+    return mutationId;
+  }
+
+  Future<void> suppressSyncOutbox(DatabaseExecutor executor) async {
+    await executor.insert(
+      'sync_runtime',
+      {'key': 'suppress_outbox', 'value': '1'},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> resumeSyncOutbox(DatabaseExecutor executor) async {
+    await executor.delete(
+      'sync_runtime',
+      where: 'key = ?',
+      whereArgs: ['suppress_outbox'],
+    );
+  }
+
+  String _newLocalUuid() {
+    final secureRandom = math.Random.secure();
+    final bytes = List<int>.generate(16, (_) => secureRandom.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    String hex(int start, int length) => bytes
+        .skip(start)
+        .take(length)
+        .map((value) => value.toRadixString(16).padLeft(2, '0'))
+        .join();
+    return '${hex(0, 4)}-${hex(4, 2)}-${hex(6, 2)}-'
+        '${hex(8, 2)}-${hex(10, 6)}';
+  }
+
   Future<void> _createSyncOutboxTable(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sync_outbox (
@@ -499,6 +576,131 @@ class AppDatabase {
       'ON sync_outbox(updatedAt)',
     );
     _syncOutboxReady = true;
+  }
+
+  Future<void> _createSyncV2Schema(Database db) async {
+    await _createSyncOutboxTable(db);
+    await _ensureSyncV2SchemaOnExecutor(db);
+    _syncOutboxReady = true;
+  }
+
+  Future<void> _ensureSyncV2SchemaOnExecutor(DatabaseExecutor db) async {
+    Future<void> addColumn(String table, String definition) async {
+      final columnName = definition.trim().split(RegExp(r'\s+')).first;
+      final columns = await db.rawQuery('PRAGMA table_info($table)');
+      if (!columns.any((row) => row['name'] == columnName)) {
+        await db.execute('ALTER TABLE $table ADD COLUMN $definition');
+      }
+    }
+
+    for (final table in const [
+      'topics',
+      'courses',
+      'cards',
+      'card_examples',
+      'review_states',
+    ]) {
+      await addColumn(table, 'remoteId TEXT');
+      await addColumn(table, 'serverRevision INTEGER NOT NULL DEFAULT 0');
+      await addColumn(table, 'lastDeviceId TEXT');
+      await addColumn(table, 'lastMutationId TEXT');
+    }
+    await addColumn('card_examples', 'deletedAt TEXT');
+    await addColumn('review_states', 'deletedAt TEXT');
+
+    await addColumn('sync_outbox', 'tableName TEXT');
+    await addColumn('sync_outbox', "operation TEXT NOT NULL DEFAULT 'upsert'");
+    await addColumn('sync_outbox', 'remoteId TEXT');
+    await addColumn('sync_outbox', 'mutationId TEXT');
+    await addColumn('sync_outbox', 'baseRevision INTEGER NOT NULL DEFAULT 0');
+    await addColumn('sync_outbox', 'payload TEXT');
+    await addColumn('sync_outbox', "status TEXT NOT NULL DEFAULT 'pending'");
+    await addColumn('sync_outbox', 'nextAttemptAt TEXT');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_runtime (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_sync_outbox_v2_retry '
+      'ON sync_outbox(status, nextAttemptAt, createdAt)',
+    );
+
+    const mutationIdSql = "lower(hex(randomblob(4))) || '-' || "
+        "lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))), 2) || '-8' || "
+        "substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))";
+    for (final table in const [
+      'topics',
+      'courses',
+      'cards',
+      'card_examples',
+      'review_states',
+    ]) {
+      final entityExpr = "CAST(NEW.id AS TEXT)";
+      final deleteEntityExpr = "CAST(OLD.id AS TEXT)";
+      final deletedColumn = 'deletedAt';
+      await db.execute('DROP TRIGGER IF EXISTS sync_v2_${table}_insert');
+      await db.execute('DROP TRIGGER IF EXISTS sync_v2_${table}_update');
+      await db.execute('DROP TRIGGER IF EXISTS sync_v2_${table}_delete');
+      await db.execute('''
+        CREATE TRIGGER sync_v2_${table}_insert
+        AFTER INSERT ON $table
+        WHEN COALESCE((SELECT value FROM sync_runtime WHERE key = 'suppress_outbox'), '0') <> '1'
+        BEGIN
+          INSERT OR REPLACE INTO sync_outbox(
+            kind, entityId, tableName, operation, remoteId, mutationId,
+            baseRevision, createdAt, updatedAt, nextAttemptAt, attempts, status, lastError
+          ) VALUES(
+            'v2:$table', $entityExpr, '$table',
+            CASE WHEN NEW.$deletedColumn IS NULL THEN 'upsert' ELSE 'delete' END,
+            NEW.remoteId, $mutationIdSql, 0,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), 0, 'pending', NULL
+          );
+        END
+      ''');
+      await db.execute('''
+        CREATE TRIGGER sync_v2_${table}_update
+        AFTER UPDATE ON $table
+        WHEN COALESCE((SELECT value FROM sync_runtime WHERE key = 'suppress_outbox'), '0') <> '1'
+        BEGIN
+          INSERT OR REPLACE INTO sync_outbox(
+            kind, entityId, tableName, operation, remoteId, mutationId,
+            baseRevision, createdAt, updatedAt, nextAttemptAt, attempts, status, lastError
+          ) VALUES(
+            'v2:$table', $entityExpr, '$table',
+            CASE WHEN NEW.$deletedColumn IS NULL THEN 'upsert' ELSE 'delete' END,
+            COALESCE(NEW.remoteId, OLD.remoteId), $mutationIdSql,
+            COALESCE(OLD.serverRevision, 0),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), 0, 'pending', NULL
+          );
+        END
+      ''');
+      await db.execute('''
+        CREATE TRIGGER sync_v2_${table}_delete
+        BEFORE DELETE ON $table
+        WHEN COALESCE((SELECT value FROM sync_runtime WHERE key = 'suppress_outbox'), '0') <> '1'
+        BEGIN
+          INSERT OR REPLACE INTO sync_outbox(
+            kind, entityId, tableName, operation, remoteId, mutationId,
+            baseRevision, payload, createdAt, updatedAt, nextAttemptAt,
+            attempts, status, lastError
+          ) VALUES(
+            'v2:$table', $deleteEntityExpr, '$table', 'delete', OLD.remoteId,
+            $mutationIdSql, COALESCE(OLD.serverRevision, 0),
+            json_object('deleted_at', strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), 0, 'pending', NULL
+          );
+        END
+      ''');
+    }
   }
 
   Future<void> ensureTopicSchema() async {

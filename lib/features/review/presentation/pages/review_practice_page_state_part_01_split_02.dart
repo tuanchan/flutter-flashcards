@@ -151,6 +151,13 @@ extension ReviewPracticePageStatePart01Split02 on _ReviewPracticePageState {
               whereArgs: [card.id],
             );
           }
+          await AppDatabase.instance.enqueueReviewMutation(
+            txn,
+            cardId: card.id,
+            rating: isCorrect ? 'Good' : 'Again',
+            reviewedAt: now,
+            baseRevision: (previousState?['serverRevision'] as num?)?.toInt(),
+          );
 
           final sessionSummary = await txn.rawQuery(
             '''
@@ -175,12 +182,6 @@ extension ReviewPracticePageStatePart01Split02 on _ReviewPracticePageState {
             whereArgs: [sessionId],
           );
 
-          await AppDatabase.instance.enqueueSyncOutbox(
-            txn,
-            kind: 'review_card',
-            entityId: card.id,
-            queuedAt: now,
-          );
           await AppDatabase.instance.enqueueSyncOutbox(
             txn,
             kind: 'review_session',

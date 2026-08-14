@@ -989,11 +989,6 @@ extension StatisticsPageStatePart07 on _StatisticsPageState {
           whereArgs: [cardId],
         );
       }
-      await AppDatabase.instance.enqueueSyncOutbox(
-        txn,
-        kind: 'review_card',
-        entityId: cardId,
-      );
     });
     
     if (SupabaseConfig.isLoggedIn) {

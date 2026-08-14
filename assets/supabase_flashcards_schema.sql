@@ -137,6 +137,9 @@ create table if not exists public.topics (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   deleted_at timestamptz,
+  revision bigint not null default 1,
+  last_device_id text,
+  last_mutation_id uuid,
   unique (id, owner_id)
 );
 
@@ -158,6 +161,9 @@ create table if not exists public.courses (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   deleted_at timestamptz,
+  revision bigint not null default 1,
+  last_device_id text,
+  last_mutation_id uuid,
   unique (id, owner_id),
   foreign key (topic_id, owner_id)
     references public.topics(id, owner_id) on delete set null (topic_id)
@@ -187,6 +193,9 @@ create table if not exists public.cards (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   deleted_at timestamptz,
+  revision bigint not null default 1,
+  last_device_id text,
+  last_mutation_id uuid,
   unique (id, owner_id),
   foreign key (course_id, owner_id)
     references public.courses(id, owner_id) on delete cascade
@@ -206,6 +215,10 @@ create table if not exists public.card_examples (
   meaning text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  revision bigint not null default 1,
+  last_device_id text,
+  last_mutation_id uuid,
   unique (id, owner_id),
   foreign key (card_id, owner_id)
     references public.cards(id, owner_id) on delete cascade
@@ -253,6 +266,10 @@ create table if not exists public.review_states (
   next_review_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  revision bigint not null default 1,
+  last_device_id text,
+  last_mutation_id uuid,
   unique (id, owner_id),
   unique (owner_id, card_id),
   foreign key (card_id, owner_id)
