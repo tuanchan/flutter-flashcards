@@ -214,7 +214,10 @@ class _AppThemeLoaderState extends State<AppThemeLoader>
     }
   }
 
-  Future<void> _startSessionAndCatchUp({bool newLogin = false}) async {
+  Future<void> _startSessionAndCatchUp({
+    bool newLogin = false,
+    bool fullSnapshot = true,
+  }) async {
     if (_catchUpInFlight || !SupabaseConfig.isLoggedIn) return;
     _catchUpInFlight = true;
     try {
@@ -226,7 +229,25 @@ class _AppThemeLoaderState extends State<AppThemeLoader>
       // If the network is still unavailable this safely leaves the markers in
       // SQLite so they can be retried before a later replacement download.
       await _retryOutboxSafely();
+      if (!fullSnapshot) {
+        // A Windows resume only needs the v2 delta missed while suspended.
+        // Reopening the channel triggers sync_v2_changes_since; downloading
+        // the full 60k-row account snapshot here blocks Realtime/UI updates.
+        SupabaseSyncService.instance.restartRealtimeSync();
+        await _retryOutboxSafely();
+        return;
+      }
       final ownerId = SupabaseConfig.currentUser?.id;
+      if (!newLogin &&
+          await SupabaseSyncService.instance.hasReusableLocalSnapshot()) {
+        // beginAuthenticatedSession already opened Realtime. Its subscribed
+        // callback applies sync_v2_changes_since, so a normal app start keeps
+        // the existing local snapshot visible and catches up only the delta.
+        _lastCatchUpAt = DateTime.now();
+        _lastCatchUpOwnerId = ownerId;
+        await _retryOutboxSafely();
+        return;
+      }
       final now = DateTime.now();
       final recentlyCaughtUp = ownerId != null &&
           ownerId == _lastCatchUpOwnerId &&
@@ -300,7 +321,7 @@ class _AppThemeLoaderState extends State<AppThemeLoader>
       if (backgroundedAt != null &&
           DateTime.now().difference(backgroundedAt) >=
               const Duration(seconds: 30)) {
-        unawaited(_startSessionAndCatchUp());
+        unawaited(_startSessionAndCatchUp(fullSnapshot: false));
       } else {
         unawaited(SupabaseSyncService.instance.beginAuthenticatedSession());
         unawaited(_retryOutboxSafely());

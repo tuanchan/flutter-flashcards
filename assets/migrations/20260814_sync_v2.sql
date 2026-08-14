@@ -284,6 +284,7 @@ declare
   v_owner uuid := auth.uid();
   v_id uuid := coalesce(p_entity_id, gen_random_uuid());
   v_current_revision bigint;
+  v_current_mutation_id uuid;
   v_row jsonb;
   v_receipt jsonb;
   v_payload jsonb := coalesce(p_payload, '{}'::jsonb);
@@ -300,12 +301,19 @@ begin
     raise exception using errcode='22023', message='mutation_id and device_id are required';
   end if;
 
+  -- Serialize retries of one mutation before checking its receipt. Without
+  -- this lock, two simultaneous clients can both miss the receipt and then
+  -- block each other while applying the same entity update.
+  perform pg_advisory_xact_lock(
+    hashtextextended(v_owner::text || ':' || p_mutation_id::text, 0)
+  );
   select response into v_receipt from public.sync_mutation_receipts
   where owner_id=v_owner and mutation_id=p_mutation_id;
   if found then return v_receipt; end if;
 
   if p_table='review_states' and nullif(v_payload->>'card_id','') is not null then
-    select id,revision into v_id,v_current_revision
+    select id,revision,last_mutation_id
+      into v_id,v_current_revision,v_current_mutation_id
     from public.review_states
     where owner_id=v_owner and card_id=(v_payload->>'card_id')::uuid
     for update;
@@ -314,13 +322,13 @@ begin
       v_current_revision := null;
     end if;
   else
-    execute format('select revision from public.%I where owner_id=$1 and id=$2 for update', p_table)
-      into v_current_revision using v_owner, v_id;
+    execute format('select revision,last_mutation_id from public.%I where owner_id=$1 and id=$2 for update', p_table)
+      into v_current_revision,v_current_mutation_id using v_owner, v_id;
   end if;
 
   if v_current_revision is null then
     if coalesce(p_base_revision,0) <> 0 then
-      raise exception using errcode='40001', message=format('sync conflict: %s/%s is missing',p_table,v_id);
+      raise exception using errcode='PT409', message=format('sync conflict: %s/%s is missing',p_table,v_id);
     end if;
     if p_operation='delete' then
       v_receipt := jsonb_build_object('table',p_table,'id',v_id,'deleted',true,'revision',0,
@@ -336,8 +344,16 @@ begin
       v_receipt := jsonb_build_object('table',p_table,'row',v_row);
     end if;
   else
-    if coalesce(p_base_revision,0) <> v_current_revision then
-      raise exception using errcode='40001', message=format(
+    -- Rows created by sync v1 predate revision metadata. Their initial
+    -- revision is 1 and last_mutation_id is null, so the first v2 mutation
+    -- with base revision 0 is allowed to adopt them safely.
+    if coalesce(p_base_revision,0) <> v_current_revision
+       and not (
+         coalesce(p_base_revision,0)=0
+         and v_current_revision=1
+         and v_current_mutation_id is null
+       ) then
+      raise exception using errcode='PT409', message=format(
         'sync conflict: %s/%s base revision %s, current revision %s',
         p_table,v_id,p_base_revision,v_current_revision);
     end if;
@@ -464,6 +480,9 @@ begin
   ) then
     raise exception using errcode='23503',message='card is missing, deleted, or belongs to another owner';
   end if;
+  perform pg_advisory_xact_lock(
+    hashtextextended(v_owner::text || ':' || p_mutation_id::text, 0)
+  );
   select response into v_receipt from public.sync_mutation_receipts
     where owner_id=v_owner and mutation_id=p_mutation_id;
   if found then return v_receipt; end if;
@@ -472,12 +491,17 @@ begin
     where owner_id=v_owner and card_id=p_card_id for update;
   if not found then
     if coalesce(p_base_revision,0) <> 0 then
-      raise exception using errcode='40001',message='sync conflict: review state is missing';
+      raise exception using errcode='PT409',message='sync conflict: review state is missing';
     end if;
     insert into public.review_states(owner_id,card_id,last_device_id,last_mutation_id)
       values(v_owner,p_card_id,p_device_id,p_mutation_id) returning * into v_row;
-  elsif coalesce(p_base_revision,0) <> v_row.revision then
-    raise exception using errcode='40001',message=format(
+  elsif coalesce(p_base_revision,0) <> v_row.revision
+        and not (
+          coalesce(p_base_revision,0)=0
+          and v_row.revision=1
+          and v_row.last_mutation_id is null
+        ) then
+    raise exception using errcode='PT409',message=format(
       'sync conflict: review state base revision %s, current revision %s',p_base_revision,v_row.revision);
   end if;
 

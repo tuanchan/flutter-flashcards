@@ -114,6 +114,7 @@ class SupabaseSyncService {
   Timer? _realtimeMergeDebounce;
   final Map<String, PostgresChangePayload> _realtimePendingChanges = {};
   Future<void> _studySyncTail = Future<void>.value();
+  Future<void> _targetedOutboxTail = Future<void>.value();
   bool _isPushingStudyData = false;
   bool _studyPushCanOverlapLearning = false;
   bool _outboxRetryInFlight = false;
@@ -590,9 +591,37 @@ class SupabaseSyncService {
   Future<SyncResult> _drainTargetedOutbox({
     String? table,
     String? entityId,
+  }) {
+    final completer = Completer<SyncResult>();
+
+    Future<void> run() async {
+      try {
+        completer.complete(await _drainTargetedOutboxOnce(
+          table: table,
+          entityId: entityId,
+        ));
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
+      }
+    }
+
+    // Creation callbacks, the periodic retry timer, Realtime reconnects and
+    // study completion can all request a drain at the same time. Serializing
+    // them prevents duplicate RPCs with the same mutation_id from locking the
+    // same receipt/entity rows and exhausting PostgREST's connection pool.
+    _targetedOutboxTail = _targetedOutboxTail
+        .catchError((Object _) {})
+        .then((_) => run());
+    return completer.future;
+  }
+
+  Future<SyncResult> _drainTargetedOutboxOnce({
+    String? table,
+    String? entityId,
   }) async {
     await AppDatabase.instance.ensureSyncOutboxTable();
     final db = await AppDatabase.instance.database;
+    await _reviveTransientDeadLetters(db);
     final now = DateTime.now().toUtc().toIso8601String();
     final where = <String>[
       'tableName IS NOT NULL',
@@ -611,11 +640,32 @@ class SupabaseSyncService {
       'sync_outbox',
       where: where.join(' AND '),
       whereArgs: args,
-      orderBy: 'createdAt ASC',
+      // A large historical delete backlog must not block a newly created
+      // topic/course/card for many retry cycles. Preserve parent-before-child
+      // order for upserts, then drain deletes in their original FIFO order.
+      orderBy: table == null && entityId == null
+          ? '''
+              CASE WHEN operation IN ('upsert', 'review') THEN 0 ELSE 1 END,
+              CASE tableName
+                WHEN 'topics' THEN 0
+                WHEN 'courses' THEN 1
+                WHEN 'cards' THEN 2
+                WHEN 'card_examples' THEN 3
+                WHEN 'review_states' THEN 4
+                ELSE 5
+              END,
+              createdAt ASC
+            '''
+          : 'createdAt ASC',
       limit: 200,
     );
     if (rows.isEmpty) return SyncResult(pushed: 0, pulled: 0);
 
+    await ServerLogService.write('sync_v2.outbox_batch_start', details: {
+      'rows': rows.length,
+      'table': table ?? 'all',
+      'entityId': entityId ?? 'all',
+    });
     var pushed = 0;
     final errors = <String>[];
     for (final raw in rows) {
@@ -623,11 +673,33 @@ class SupabaseSyncService {
       try {
         await _pushTargetedOutboxRow(db, entry);
         pushed++;
+        if (entry.operation != 'delete' || entityId != null) {
+          await ServerLogService.write('sync_v2.outbox_pushed', details: {
+            'table': entry.table,
+            'entityId': entry.entityId,
+            'operation': entry.operation,
+          });
+        }
       } catch (error) {
         errors.add('${entry.table}/${entry.entityId}: $error');
         await _failTargetedOutbox(db, entry, error);
+        if (entry.operation != 'delete' || entityId != null) {
+          await ServerLogService.write('sync_v2.outbox_push_error', details: {
+            'table': entry.table,
+            'entityId': entry.entityId,
+            'operation': entry.operation,
+            'error': error,
+          });
+        }
       }
     }
+    await ServerLogService.write('sync_v2.outbox_batch_finish', details: {
+      'rows': rows.length,
+      'pushed': pushed,
+      'errors': errors.length,
+      'table': table ?? 'all',
+      'entityId': entityId ?? 'all',
+    });
     return SyncResult(
       pushed: pushed,
       pulled: 0,
@@ -1013,8 +1085,16 @@ class SupabaseSyncService {
     }
 
     final attempts = entry.attempts + 1;
-    final dead = attempts >= 8;
-    final delaySeconds = math.min(300, math.pow(2, attempts).toInt());
+    // Server/network outages are not invalid mutations. Keep them durable and
+    // retryable for the whole outage instead of permanently dead-lettering
+    // valid local data after eight failed requests.
+    final transient = _isTransientSyncFailureText(text);
+    final dead = !transient && attempts >= 8;
+    final delayExponent = math.min(attempts, 8);
+    final delaySeconds = math.min(
+      300,
+      math.pow(2, delayExponent).toInt(),
+    );
     await db.update(
       'sync_outbox',
       {
@@ -1036,6 +1116,65 @@ class SupabaseSyncService {
         'entityId': entry.entityId,
         'attempts': attempts,
         'error': text,
+      });
+    }
+  }
+
+  bool _isTransientSyncFailureText(String error) {
+    final text = error.toLowerCase();
+    return const [
+      'pgrst000',
+      'pgrst001',
+      'pgrst002',
+      'pgrst003',
+      'service unavailable',
+      'bad gateway',
+      'gateway timeout',
+      'http 408',
+      'http 429',
+      'http 500',
+      'http 502',
+      'http 503',
+      'http 504',
+      'socketexception',
+      'timeoutexception',
+      'clientexception',
+      'failed host lookup',
+      'network is unreachable',
+      'connection closed',
+      'connection reset',
+      'connection refused',
+    ].any(text.contains);
+  }
+
+  Future<void> _reviveTransientDeadLetters(Database db) async {
+    final rows = await db.query(
+      'sync_outbox',
+      columns: const ['kind', 'entityId', 'mutationId', 'lastError'],
+      where: "tableName IS NOT NULL AND status = 'dead'",
+    );
+    if (rows.isEmpty) return;
+
+    final now = DateTime.now().toUtc().toIso8601String();
+    var revived = 0;
+    for (final row in rows) {
+      final lastError = row['lastError']?.toString() ?? '';
+      if (!_isTransientSyncFailureText(lastError)) continue;
+      revived += await db.update(
+        'sync_outbox',
+        {
+          'status': 'pending',
+          'attempts': 0,
+          'updatedAt': now,
+          'nextAttemptAt': now,
+        },
+        where: "kind = ? AND entityId = ? AND mutationId = ? AND status = 'dead'",
+        whereArgs: [row['kind'], row['entityId'], row['mutationId']],
+      );
+    }
+    if (revived > 0) {
+      await ServerLogService.write('sync_v2.transient_dead_revived', details: {
+        'rows': revived,
       });
     }
   }
@@ -1765,6 +1904,27 @@ $targetWhere
     startRealtimeSync();
   }
 
+  /// Returns true when SQLite already contains a completed snapshot for the
+  /// currently authenticated owner. Realtime's delta RPC can then catch up the
+  /// small gap since that snapshot instead of replacing every local table.
+  Future<bool> hasReusableLocalSnapshot() async {
+    final user = SupabaseConfig.currentUser;
+    if (user == null) return false;
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'app_settings',
+      columns: const ['key', 'value'],
+      where: 'key IN (?, ?)',
+      whereArgs: const ['sync.localBoundOwnerId', 'sync.lastSyncAt'],
+    );
+    final values = <String, String>{
+      for (final row in rows)
+        if (row['key'] != null) '${row['key']}': '${row['value'] ?? ''}',
+    };
+    final snapshotAt = DateTime.tryParse(values['sync.lastSyncAt'] ?? '');
+    return values['sync.localBoundOwnerId'] == user.id && snapshotAt != null;
+  }
+
   void endAuthenticatedSession() {
     stopRealtimeSync();
     _sessionOwnerId = null;
@@ -1902,9 +2062,11 @@ $targetWhere
     final client = SupabaseConfig.client;
     switch (table) {
       case 'topics':
+        await _bindIncomingTopicIdentitiesByName(db, rows);
         await _syncTable(
           db: db, client: client, ownerId: ownerId,
           localTable: table, remoteTable: table, idColumn: 'id',
+          localConflictColumns: const ['name'],
           localToRemote: _topicLocalToRemote,
           remoteToLocal: _topicRemoteToLocal,
           remoteRowsOverride: rows,
@@ -2184,6 +2346,15 @@ $targetWhere
         ? await _pendingReviewCardIds(db)
         : const <int>{};
 
+    if (table == 'topics') {
+      final incomingRows = changes
+          .map((change) => change.newRecord.isNotEmpty
+              ? Map<String, dynamic>.from(change.newRecord)
+              : Map<String, dynamic>.from(change.oldRecord))
+          .toList(growable: false);
+      await _bindIncomingTopicIdentitiesByName(db, incomingRows);
+    }
+
     // Some server editors save a card edit as INSERT(new id) + soft-delete
     // (old id). Reuse the old local card ID when both rows occupy the same
     // course/position so review states and study history keep their FK target.
@@ -2372,6 +2543,7 @@ $targetWhere
           result = await _syncTable(
             db: db, client: client, ownerId: ownerId, localTable: 'topics',
             remoteTable: 'topics', idColumn: 'id',
+            localConflictColumns: const ['name'],
             localToRemote: _topicLocalToRemote, remoteToLocal: _topicRemoteToLocal,
             remoteRowsOverride: rows,
           );
@@ -2413,6 +2585,9 @@ $targetWhere
           );
           break;
       }
+      final appliedChange = changed ||
+          (result?.pulled ?? 0) > 0 ||
+          (result?.pushed ?? 0) > 0;
       await ServerLogService.write('realtime.apply_finish', details: {
         'table': table,
         'events': changes.length,
@@ -2422,10 +2597,10 @@ $targetWhere
         'skipped': skipped,
         'pushed': result?.pushed ?? 0,
         'pulled': result?.pulled ?? 0,
-        'changed': true,
+        'changed': appliedChange,
         'error': result?.error,
       });
-      return true;
+      return appliedChange;
     } finally {
       _operation = previousOperation;
     }
@@ -2647,6 +2822,7 @@ $targetWhere
         localTable: 'topics',
         remoteTable: 'topics',
         idColumn: 'id',
+        localConflictColumns: const ['name'],
         localToRemote: _topicLocalToRemote,
         remoteToLocal: _topicRemoteToLocal,
         lastSyncAt: lastSyncAt,
@@ -2794,7 +2970,7 @@ $targetWhere
       pulled += appSettingsResult.pulled;
       collectError('app_settings', appSettingsResult);
 
-      if (_operation != _SyncOperation.livePush) {
+      if (_operation != _SyncOperation.livePush && syncErrors.isEmpty) {
         final now = DateTime.now().toIso8601String();
         await _setLocalSetting(db, 'sync.lastSyncAt', now);
       } else if (syncErrors.isEmpty && _livePushCutoffAt != null) {
@@ -3748,15 +3924,23 @@ $targetWhere
       'topics',
     ];
     await db.transaction((txn) async {
-      for (final table in deletionOrder) {
-        await txn.delete(table);
-      }
-      final settings = await txn.query('app_settings', columns: ['key']);
-      for (final row in settings) {
-        final key = row['key']?.toString() ?? '';
-        if (!_isLocalOnlySetting(key)) {
-          await txn.delete('app_settings', where: 'key = ?', whereArgs: [key]);
+      // Pull-replace is applying a server snapshot, not a user deletion.
+      // Without suppression every cleared row creates a v2 delete mutation,
+      // flooding the outbox and eventually deleting the cloud snapshot again.
+      await AppDatabase.instance.suppressSyncOutbox(txn);
+      try {
+        for (final table in deletionOrder) {
+          await txn.delete(table);
         }
+        final settings = await txn.query('app_settings', columns: ['key']);
+        for (final row in settings) {
+          final key = row['key']?.toString() ?? '';
+          if (!_isLocalOnlySetting(key)) {
+            await txn.delete('app_settings', where: 'key = ?', whereArgs: [key]);
+          }
+        }
+      } finally {
+        await AppDatabase.instance.resumeSyncOutbox(txn);
       }
     });
   }
@@ -3981,6 +4165,56 @@ $targetWhere
       final value = row[column]?.toString() ?? '';
       return '${value.length}:$value';
     }).join('|');
+  }
+
+  /// Reuses the local topic row for an incoming active topic with the same
+  /// normalized name. This is required for legacy SQLite databases where
+  /// topics.name has a column-level UNIQUE constraint: a locally deleted
+  /// topic is still present as a tombstone and cannot be inserted again.
+  ///
+  /// Binding the remote UUID before [remoteToLocal] runs lets the normal merge
+  /// update/reactivate that row while preserving its SQLite ID and child FKs.
+  Future<void> _bindIncomingTopicIdentitiesByName(
+    Database db,
+    Iterable<Map<String, dynamic>> remoteRows,
+  ) async {
+    final incoming = remoteRows.where((row) {
+      final remoteId = row['id']?.toString().trim() ?? '';
+      final identity = _normalizeIdentity(row['name']);
+      return remoteId.isNotEmpty &&
+          identity.isNotEmpty &&
+          row['deleted_at'] == null;
+    }).toList(growable: false);
+    if (incoming.isEmpty) return;
+
+    final localRows = await db.query(
+      'topics',
+      columns: ['id', 'name', 'deletedAt', 'remoteId'],
+      orderBy: 'CASE WHEN deletedAt IS NULL THEN 0 ELSE 1 END, id ASC',
+    );
+    final localByIdentity = <String, Map<String, Object?>>{};
+    for (final local in localRows) {
+      final identity = _normalizeIdentity(local['name']);
+      if (identity.isNotEmpty) {
+        localByIdentity.putIfAbsent(identity, () => local);
+      }
+    }
+
+    for (final remote in incoming) {
+      final remoteId = remote['id']!.toString();
+      final local = localByIdentity[_normalizeIdentity(remote['name'])];
+      final localId = _localInt(local?['id']);
+      if (localId == null) continue;
+
+      final previousRemoteId = local?['remoteId']?.toString().trim() ?? '';
+      if (previousRemoteId.isNotEmpty && previousRemoteId != remoteId) {
+        if (_topicLocalIdByRemote[previousRemoteId] == localId) {
+          _topicLocalIdByRemote.remove(previousRemoteId);
+        }
+      }
+      _topicLocalIdByRemote[remoteId] = localId;
+      _topicRemoteIdByLocal['$localId'] = remoteId;
+    }
   }
 
   Future<void> _prepareLocalOwner(Database db, String ownerId) async {

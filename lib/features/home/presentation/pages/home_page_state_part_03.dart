@@ -143,7 +143,15 @@ extension HomePageStatePart03 on _HomePageState {
                           await this.loadCourses(showLoading: false);
                           if (SupabaseConfig.isLoggedIn) {
                             unawaited(
-                              SupabaseSyncService.instance.syncPendingChanges(),
+                              SupabaseSyncService.instance
+                                  .pushTopicMutation(topicId)
+                                  .then((result) {
+                                if (result.hasError) {
+                                  debugPrint(
+                                    'CREATE TOPIC SYNC ERROR: ${result.error}',
+                                  );
+                                }
+                              }),
                             );
                           }
                           this.showHomeMessage("Đã tạo chủ đề");
